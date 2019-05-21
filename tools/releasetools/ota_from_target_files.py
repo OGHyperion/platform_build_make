@@ -712,6 +712,92 @@ def GetBlockDifferences(target_zip, source_zip, target_info, source_info,
 
   return block_diff_dict
 
+def GetBlockDifferences(target_zip, source_zip, target_info, source_info,
+                        device_specific):
+  """Returns a ordered dict of block differences with partition name as key."""
+
+  def GetIncrementalBlockDifferenceForPartition(name):
+    if not HasPartition(source_zip, name):
+      raise RuntimeError("can't generate incremental that adds {}".format(name))
+
+    partition_src = common.GetUserImage(name, OPTIONS.source_tmp, source_zip,
+                                        info_dict=source_info,
+                                        allow_shared_blocks=allow_shared_blocks)
+
+    hashtree_info_generator = verity_utils.CreateHashtreeInfoGenerator(
+        name, 4096, target_info)
+    partition_tgt = common.GetUserImage(name, OPTIONS.target_tmp, target_zip,
+                                        info_dict=target_info,
+                                        allow_shared_blocks=allow_shared_blocks,
+                                        hashtree_info_generator=
+                                        hashtree_info_generator)
+
+    # Check the first block of the source system partition for remount R/W only
+    # if the filesystem is ext4.
+    partition_source_info = source_info["fstab"]["/" + name]
+    check_first_block = partition_source_info.fs_type == "ext4"
+    # Disable using imgdiff for squashfs. 'imgdiff -z' expects input files to be
+    # in zip formats. However with squashfs, a) all files are compressed in LZ4;
+    # b) the blocks listed in block map may not contain all the bytes for a
+    # given file (because they're rounded to be 4K-aligned).
+    partition_target_info = target_info["fstab"]["/" + name]
+    disable_imgdiff = (partition_source_info.fs_type == "squashfs" or
+                       partition_target_info.fs_type == "squashfs")
+    return common.BlockDifference(name, partition_src, partition_tgt,
+                                  check_first_block,
+                                  version=blockimgdiff_version,
+                                  disable_imgdiff=disable_imgdiff)
+
+  if source_zip:
+    # See notes in common.GetUserImage()
+    allow_shared_blocks = (source_info.get('ext4_share_dup_blocks') == "true" or
+                           target_info.get('ext4_share_dup_blocks') == "true")
+    blockimgdiff_version = max(
+        int(i) for i in target_info.get(
+            "blockimgdiff_versions", "1").split(","))
+    assert blockimgdiff_version >= 3
+
+  block_diff_dict = collections.OrderedDict()
+  partition_names = ["system", "vendor", "product", "odm", "system_ext"]
+  for partition in partition_names:
+    if not HasPartition(target_zip, partition):
+      continue
+    # Full OTA update.
+    if not source_zip:
+      tgt = common.GetUserImage(partition, OPTIONS.input_tmp, target_zip,
+                                info_dict=target_info,
+                                reset_file_map=True)
+      block_diff_dict[partition] = common.BlockDifference(partition, tgt,
+                                                          src=None)
+    # Incremental OTA update.
+    else:
+      block_diff_dict[partition] = GetIncrementalBlockDifferenceForPartition(
+          partition)
+  assert "system" in block_diff_dict
+
+  # Get the block diffs from the device specific script. If there is a
+  # duplicate block diff for a partition, ignore the diff in the generic script
+  # and use the one in the device specific script instead.
+  if source_zip:
+    device_specific_diffs = device_specific.IncrementalOTA_GetBlockDifferences()
+    function_name = "IncrementalOTA_GetBlockDifferences"
+  else:
+    device_specific_diffs = device_specific.FullOTA_GetBlockDifferences()
+    function_name = "FullOTA_GetBlockDifferences"
+
+  if device_specific_diffs:
+    assert all(isinstance(diff, common.BlockDifference)
+               for diff in device_specific_diffs), \
+        "{} is not returning a list of BlockDifference objects".format(
+            function_name)
+    for diff in device_specific_diffs:
+      if diff.partition in block_diff_dict:
+        logger.warning("Duplicate block difference found. Device specific block"
+                       " diff for partition '%s' overrides the one in generic"
+                       " script.", diff.partition)
+      block_diff_dict[diff.partition] = diff
+
+  return block_diff_dict
 
 def WriteFullOTAPackage(input_zip, output_file):
   target_info = common.BuildInfo(OPTIONS.info_dict, OPTIONS.oem_dicts)
@@ -811,6 +897,19 @@ else if get_stage("%(bcb_dev)s") == "3/3" then
   script.AppendExtra("ifelse(is_mounted(\"/system\"), unmount(\"/system\"));")
   device_specific.FullOTA_InstallBegin()
 
+  CopyInstallTools(output_zip)
+  script.UnpackPackageDir("install", "/tmp/install")
+  script.SetPermissionsRecursive("/tmp/install", 0, 0, 0o755, 0o644, None, None)
+  script.SetPermissionsRecursive("/tmp/install/bin", 0, 0, 0o755, 0o755, None, None)
+
+  if target_info.get("system_root_image") == "true":
+    sysmount = "/"
+  else:
+    sysmount = "/system"
+
+  if OPTIONS.backuptool:
+    script.RunBackup("backup", sysmount)
+
   # All other partitions as well as the data wipe use 10% of the progress, and
   # the update of the system partition takes the remaining progress.
   system_progress = 0.9 - (len(block_diff_dict) - 1) * 0.1
@@ -824,7 +923,7 @@ else if get_stage("%(bcb_dev)s") == "3/3" then
     # be re-added.
     dynamic_partitions_diff = common.DynamicPartitionsDifference(
         info_dict=OPTIONS.info_dict,
-        block_diffs=block_diffs,
+        block_diffs=block_diff_dict.values(),
         progress_dict=progress_dict,
         build_without_vendor=(not HasVendorPartition(input_zip)))
     dynamic_partitions_diff.WriteScript(script, output_zip,
@@ -841,6 +940,12 @@ else if get_stage("%(bcb_dev)s") == "3/3" then
       "boot.img", "boot.img", OPTIONS.input_tmp, "BOOT")
   common.CheckSize(boot_img.data, "boot.img", target_info)
   common.ZipWriteStr(output_zip, "boot.img", boot_img.data)
+
+  device_specific.FullOTA_PostValidate()
+
+  if OPTIONS.backuptool:
+    script.ShowProgress(0.02, 10)
+    script.RunBackup("restore", sysmount)
 
   script.WriteRawImage("/boot", "boot.img")
 
